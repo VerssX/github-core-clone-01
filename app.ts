@@ -481,6 +481,7 @@ interface IssueRecord {
   state: 'open' | 'closed';
   labels: string[];
   createdSeq: number;
+  jsonPayload?: Buffer;
 }
 
 interface CommentRecord {
@@ -933,6 +934,8 @@ function commitsBetween(repo: RepoRecord, fromOid: string, toOid: string): strin
 
 // ---------------------------------------------------------------- REST shapes and helpers
 
+const SCENARIO_EPOCH_ISO = new Date(SCENARIO_EPOCH_SEC * 1000).toISOString();
+
 function repoJson(repo: RepoRecord): Record<string, unknown> {
   return {
     id: repo.dbId,
@@ -942,8 +945,8 @@ function repoJson(repo: RepoRecord): Record<string, unknown> {
     private: repo.isPrivate,
     description: repo.description,
     default_branch: repo.defaultBranch,
-    created_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
-    updated_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
+    created_at: SCENARIO_EPOCH_ISO,
+    updated_at: SCENARIO_EPOCH_ISO,
     html_url: `https://github.com/${repo.owner}/${repo.name}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}`,
   };
@@ -958,8 +961,8 @@ function issueJson(issue: IssueRecord): Record<string, unknown> {
     state: issue.state,
     labels: issue.labels.map((name) => ({ name })),
     user: { login: VIEWER_LOGIN, id: VIEWER_ID },
-    created_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
-    updated_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
+    created_at: SCENARIO_EPOCH_ISO,
+    updated_at: SCENARIO_EPOCH_ISO,
   };
 }
 
@@ -984,8 +987,8 @@ function pullJson(repo: RepoRecord, pull: PullRecord): Record<string, unknown> {
     merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
     user: { login: VIEWER_LOGIN, id: VIEWER_ID },
-    created_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
-    updated_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
+    created_at: SCENARIO_EPOCH_ISO,
+    updated_at: SCENARIO_EPOCH_ISO,
   };
 }
 
@@ -994,8 +997,8 @@ function commentJson(comment: CommentRecord): Record<string, unknown> {
     id: comment.id,
     body: comment.body,
     user: { login: VIEWER_LOGIN, id: VIEWER_ID },
-    created_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
-    updated_at: new Date(SCENARIO_EPOCH_SEC * 1000).toISOString(),
+    created_at: SCENARIO_EPOCH_ISO,
+    updated_at: SCENARIO_EPOCH_ISO,
   };
 }
 
@@ -1073,8 +1076,7 @@ function stripOwnerPrefix(ref: string): string {
 
 // ---------------------------------------------------------------- HTTP response helpers
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
-  const payload = Buffer.from(JSON.stringify(body), 'utf8');
+function sendJsonPayload(res: ServerResponse, status: number, payload: Buffer, extraHeaders: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': nextRequestId(),
@@ -1082,6 +1084,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
     ...extraHeaders,
   });
   res.end(payload);
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+  sendJsonPayload(res, status, Buffer.from(JSON.stringify(body), 'utf8'), extraHeaders);
 }
 
 function sendNoContent(res: ServerResponse): void {
@@ -1603,7 +1609,10 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           return true;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(issue));
+          if (issue.jsonPayload === undefined) {
+            issue.jsonPayload = Buffer.from(JSON.stringify(issueJson(issue)), 'utf8');
+          }
+          sendJsonPayload(res, 200, issue.jsonPayload);
           return true;
         }
         if (method === 'PATCH') {
@@ -1631,7 +1640,8 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
             }
             issue.labels = labels;
           }
-          sendJson(res, 200, issueJson(issue));
+          issue.jsonPayload = Buffer.from(JSON.stringify(issueJson(issue)), 'utf8');
+          sendJsonPayload(res, 200, issue.jsonPayload);
           return true;
         }
         return false;
@@ -2302,6 +2312,7 @@ const RESOLVERS: Record<string, Record<string, FieldResolver>> = {
       const issue = repo?.issues.get(Number.parseInt(decoded.parts[1] ?? '', 10));
       if (repo === undefined || issue === undefined) return null;
       issue.state = 'closed';
+      issue.jsonPayload = undefined;
       return { __typename: 'CloseIssuePayload', issue: issueValue(repo, issue) };
     },
     createPullRequest: (_parent, field, ctx) => {
@@ -3267,21 +3278,33 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
   }
   if (tail === 'git-upload-pack' && method === 'POST') {
     try {
+      const uploadCacheKey = `${repoRefsCacheKey(repo, 'upload-pack')}:${repo.objects.size}:${body.toString('latin1')}`;
+      const cachedUpload = repo.advCache.get(uploadCacheKey);
+      if (cachedUpload !== undefined) {
+        sendBuffer(res, 200, cachedUpload, 'application/x-git-upload-pack-result');
+        return true;
+      }
       const packets = decodePktLines(body);
       const firstLine = packets.find((packet) => packet.kind === 'data')?.payload.toString('utf8') ?? '';
       if (req.headers['git-protocol'] === 'version=2' || firstLine.startsWith('command=')) {
         if (firstLine.startsWith('command=ls-refs')) {
-          sendBuffer(res, 200, handleLsRefs(repo, packets), 'application/x-git-upload-pack-result');
+          const reply = handleLsRefs(repo, packets);
+          repo.advCache.set(uploadCacheKey, reply);
+          sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
           return true;
         }
         if (firstLine.startsWith('command=fetch')) {
-          sendBuffer(res, 200, handleFetchV2(repo, packets), 'application/x-git-upload-pack-result');
+          const reply = handleFetchV2(repo, packets);
+          repo.advCache.set(uploadCacheKey, reply);
+          sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
           return true;
         }
         sendBuffer(res, 400, Buffer.from('Bad Request\n', 'utf8'), 'text/plain; charset=utf-8');
         return true;
       }
-      sendBuffer(res, 200, handleFetchV0(repo, packets), 'application/x-git-upload-pack-result');
+      const reply = handleFetchV0(repo, packets);
+      repo.advCache.set(uploadCacheKey, reply);
+      sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
       return true;
     } catch {
       sendBuffer(res, 400, Buffer.from('Bad Request\n', 'utf8'), 'text/plain; charset=utf-8');
