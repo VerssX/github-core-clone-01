@@ -1,0 +1,1 @@
+{"description":"In-memory GitHub-compatible forge with cached tree flattening and ref advertisements","engines":{"node":">=22.18"},"license":"MIT","name":"verssx-github-core-forge","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.1.0"}
