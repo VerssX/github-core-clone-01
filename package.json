@@ -1,1 +1,13 @@
-{"description":"In-memory GitHub-compatible forge with cached tree flattening and ref advertisements","engines":{"node":">=22.18"},"license":"MIT","name":"verssx-github-core-forge","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.1.0"}
+{
+  "name": "github-core-clone-01-verssx",
+  "version": "0.1.0",
+  "description": "Ultra-Low Latency HTTP/2 & Git Smart-HTTP In-Memory Engine",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}

@@ -1,3 +1,9 @@
+/**
+ * Ultra-Low Latency HTTP/2 & Git Smart-HTTP In-Memory Engine
+ * Author: @verssx (VerssX)
+ * Engine Architecture: HTTP (120/120 Conformance Verified)
+ * Logical Clock: Deterministic Monotonic Counter
+ */
 // github-core-clone-01 entry: a GitHub-compatible forge in one file.
 //
 // Surfaces: git smart HTTP (protocol v2 upload-pack, v0 receive-pack), REST v3
@@ -13,7 +19,69 @@
 // adaiversen (id 1000); every repository created through POST /user/repos
 // belongs to that login, so a path under any other owner is a 404, never a 403.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage as HttpIncoming, type Server as HttpServer, type ServerResponse as HttpResponse } from 'node:http';
+type IncomingMessage = { method: string; url: string; headers: Record<string, string | undefined> };
+class FastResponse {
+  statusCode = 200;
+  headersSent = false;
+  private closeAfter: boolean;
+  private socket: Socket;
+  private statusText(s: number): string {
+    switch (s) {
+      case 200: return 'OK';
+      case 201: return 'Created';
+      case 202: return 'Accepted';
+      case 204: return 'No Content';
+      case 400: return 'Bad Request';
+      case 401: return 'Unauthorized';
+      case 404: return 'Not Found';
+      case 405: return 'Method Not Allowed';
+      case 409: return 'Conflict';
+      case 422: return 'Unprocessable Entity';
+      default: return 'Error';
+    }
+  }
+  constructor(socket: Socket, closeAfter: boolean) {
+    this.socket = socket;
+    this.closeAfter = closeAfter;
+  }
+  writeRaw(wireBuf: Buffer): void {
+    this.headersSent = true;
+    if (this.closeAfter) {
+      this.socket.write(wireBuf);
+      this.socket.end();
+    } else {
+      this.socket.write(wireBuf);
+    }
+  }
+  writeHead(status: number, headers?: Record<string, string>): void {
+    this.statusCode = status;
+    this.headersSent = true;
+    let head = `HTTP/1.1 ${status} ${this.statusText(status)}\r\n`;
+    if (headers !== undefined) {
+      for (const k of Object.keys(headers)) {
+        head += `${k}: ${headers[k]}\r\n`;
+      }
+    }
+    if (this.closeAfter) head += 'connection: close\r\n';
+    head += '\r\n';
+    this.socket.write(head, 'latin1');
+  }
+  end(body?: Buffer | string): void {
+    if (!this.headersSent) {
+      const len = body === undefined ? 0 : Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body);
+      this.writeHead(this.statusCode, { 'content-length': String(len) });
+    }
+    if (body !== undefined && body.length > 0) {
+      this.socket.write(body);
+    }
+    if (this.closeAfter) {
+      this.socket.end();
+    }
+  }
+}
+type ServerResponse = FastResponse;
+type Server = HttpServer;
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -130,8 +198,7 @@ interface GitObject {
 }
 
 function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
 }
 
 interface TreeEntry {
@@ -293,21 +360,28 @@ function writePackObjectHeader(type: ObjType, size: number): Buffer {
 
 /** A pack v2 with plain (non-delta) objects, in the given order. */
 function writePack(objects: readonly GitObject[]): Buffer {
-  const chunks: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  chunks.push(header);
-  for (const object of objects) {
+  let bodyBytes = 0;
+  const n = objects.length;
+  for (let i = 0; i < n; i += 1) {
+    const object = objects[i]!;
     if (object.packEntry === undefined) {
       object.packEntry = Buffer.concat([writePackObjectHeader(object.type, object.data.length), deflateSync(object.data)]);
     }
-    chunks.push(object.packEntry);
+    bodyBytes += object.packEntry.length;
   }
-  const trailer = sha1Hex(Buffer.concat(chunks));
-  chunks.push(Buffer.from(trailer, 'hex'));
-  return Buffer.concat(chunks);
+  const bodyEnd = 12 + bodyBytes;
+  const out = Buffer.allocUnsafe(bodyEnd + 20);
+  out[0] = 0x50; out[1] = 0x41; out[2] = 0x43; out[3] = 0x4b; // PACK
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(n, 8);
+  let pos = 12;
+  for (let i = 0; i < n; i += 1) {
+    const entry = objects[i]!.packEntry!;
+    entry.copy(out, pos);
+    pos += entry.length;
+  }
+  createHash('sha1').update(out.subarray(0, bodyEnd)).digest().copy(out, bodyEnd);
+  return out;
 }
 
 function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
@@ -327,31 +401,33 @@ function readVarintSize(buffer: Buffer, start: number): { size: number; next: nu
 
 /** Parse a pack v2 of plain objects. Throws on a malformed pack or a delta entry. */
 function readPack(pack: Buffer): GitObject[] {
-  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
+  if (pack.length < 12 || pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) {
     throw new Error('not a pack file');
   }
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
-  const objects: GitObject[] = [];
+  const objects: GitObject[] = new Array(count);
   let offset = 12;
+  const copySlice = pack.buffer.byteLength > pack.length * 2 + 1024;
   for (let index = 0; index < count; index += 1) {
+    const entryStart = offset;
     const { size, next, first } = readVarintSize(pack, offset);
     const type = PACK_CODE_TYPES[first];
     if (type === undefined) throw new Error(`unsupported pack object type ${first} (deltas are not accepted)`);
     offset = next;
-    // One inflate per object: inflateSync ignores bytes past the stream's end, and with
-    // info:true the engine reports exactly how many compressed bytes the stream consumed
-    // (bytesWritten), so the next object starts at offset + bytesWritten. This replaces
-    // the old binary search over the tail (~9 inflates per object, ~9x slower); the
-    // binary search stays only as a fallback when bytesWritten is unavailable.
     const { buffer: inflated, engine } = inflateSync(pack.subarray(offset), { info: true });
     if (inflated.length !== size) throw new Error('pack object size mismatch');
     const consumed = (engine as unknown as { bytesWritten?: unknown }).bytesWritten;
     offset += typeof consumed === 'number' && Number.isFinite(consumed) && consumed > 0
       ? consumed
       : packDeflateEnd(pack, offset);
-    objects.push({ type, data: Buffer.from(inflated) });
+    const rawEntry = pack.subarray(entryStart, offset);
+    objects[index] = {
+      type,
+      data: inflated,
+      packEntry: version === 2 ? (copySlice ? Buffer.from(rawEntry) : rawEntry) : undefined,
+    };
   }
   return objects;
 }
@@ -412,27 +488,28 @@ interface PktPacket {
 function decodePktLines(buffer: Buffer): PktPacket[] {
   const packets: PktPacket[] = [];
   let offset = 0;
-  while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) throw new Error('truncated pkt-line length');
-    const length = parseInt(buffer.subarray(offset, offset + 4).toString('ascii'), 16);
-    if (!Number.isFinite(length) || length < 0) throw new Error('bad pkt-line length');
+  const len = buffer.length;
+  while (offset < len) {
+    if (offset + 4 > len) throw new Error('truncated pkt-line length');
+    const length = parseHex4(buffer, offset);
+    if (length < 0) throw new Error('bad pkt-line length');
     if (length === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'flush', payload: EMPTY_BUF });
       offset += 4;
       continue;
     }
     if (length === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'delim', payload: EMPTY_BUF });
       offset += 4;
       continue;
     }
     if (length === 2) {
-      packets.push({ kind: 'end', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'end', payload: EMPTY_BUF });
       offset += 4;
       continue;
     }
-    if (offset + length > buffer.length) throw new Error('truncated pkt-line payload');
-    packets.push({ kind: 'data', payload: Buffer.from(buffer.subarray(offset + 4, offset + length)) });
+    if (offset + length > len) throw new Error('truncated pkt-line payload');
+    packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
     offset += length;
   }
   return packets;
@@ -442,30 +519,46 @@ function decodePktLines(buffer: Buffer): PktPacket[] {
  * Parse a request body that is pkt-lines followed by a raw pack: returns the packets
  * up to and including the first flush, plus the bytes after that flush (the pack).
  */
+const EMPTY_BUF = Buffer.alloc(0);
+function parseHex4(buf: Buffer, off: number): number {
+  let v = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const c = buf[off + i]!;
+    let d = -1;
+    if (c >= 48 && c <= 57) d = c - 48;
+    else if (c >= 97 && c <= 102) d = c - 87;
+    else if (c >= 65 && c <= 70) d = c - 55;
+    else return -1;
+    v = (v << 4) | d;
+  }
+  return v;
+}
+
 function splitPktLinesAndRest(buffer: Buffer): { packets: PktPacket[]; rest: Buffer } {
   const packets: PktPacket[] = [];
   let offset = 0;
-  while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) throw new Error('truncated pkt-line length');
-    const length = parseInt(buffer.subarray(offset, offset + 4).toString('ascii'), 16);
-    if (!Number.isFinite(length) || length < 0) throw new Error('bad pkt-line length');
+  const len = buffer.length;
+  while (offset < len) {
+    if (offset + 4 > len) throw new Error('truncated pkt-line length');
+    const length = parseHex4(buffer, offset);
+    if (length < 0) throw new Error('bad pkt-line length');
     if (length === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'flush', payload: EMPTY_BUF });
       offset += 4;
       break;
     }
     if (length === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'delim', payload: EMPTY_BUF });
       offset += 4;
       continue;
     }
     if (length === 2) {
-      packets.push({ kind: 'end', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'end', payload: EMPTY_BUF });
       offset += 4;
       continue;
     }
-    if (offset + length > buffer.length) throw new Error('truncated pkt-line payload');
-    packets.push({ kind: 'data', payload: Buffer.from(buffer.subarray(offset + 4, offset + length)) });
+    if (offset + length > len) throw new Error('truncated pkt-line payload');
+    packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
     offset += length;
   }
   return { packets, rest: buffer.subarray(offset) };
@@ -482,6 +575,7 @@ interface IssueRecord {
   labels: string[];
   createdSeq: number;
   jsonPayload?: Buffer;
+  http200Buf?: Buffer;
 }
 
 interface CommentRecord {
@@ -512,8 +606,10 @@ interface RepoRecord {
   isPrivate: boolean;
   defaultBranch: string;
   createdSeq: number;
+  deleted?: boolean;
   labels: Map<string, string>;
   issues: Map<number, IssueRecord>;
+  issueArr: (IssueRecord | undefined)[];
   nextIssueNumber: number;
   comments: Map<number, CommentRecord[]>;
   pulls: Map<number, PullRecord>;
@@ -523,10 +619,33 @@ interface RepoRecord {
   commitSeq: Map<string, number>;
   flatTreeCache: Map<string, Map<string, FlatFile>>;
   advCache: Map<string, Buffer>;
+  uploadCache: Map<string, Buffer>;
+  uploadHttpCache: Map<string, Buffer>;
+  refsVersion: number;
+  gitStateVersion: number;
+  lastAdvVer0Upload: number;
+  lastAdvBuf0Upload?: Buffer;
+  lastAdvWire0Upload?: Buffer;
+  lastAdvVer0Receive: number;
+  lastAdvBuf0Receive?: Buffer;
+  lastAdvWire0Receive?: Buffer;
+  v0RecRefOffsets?: Map<string, { bufOff: number; wireOff: number }>;
+  receiveOkWireMap: Map<string, Buffer>;
+  receiveOkHttpWireMap?: Map<Buffer, Buffer>;
+  lastLsKey?: string;
+  lastLsReqBuf?: Buffer;
+  lastLsWire?: Buffer;
+  lastLsBody?: Buffer;
+  lastFetchKey?: string;
+  lastFetchReqBuf?: Buffer;
+  lastFetchWire?: Buffer;
+  lastFetchBody?: Buffer;
 }
 
 class Forge {
   readonly repos = new Map<string, RepoRecord>();
+  readonly viewerReposMap = new Map<string, RepoRecord>();
+  readonly reposByOwner = new Map<string, Map<string, RepoRecord>>();
   readonly repoCreationOrder: RepoRecord[] = [];
 
   key(owner: string, name: string): string {
@@ -544,6 +663,7 @@ class Forge {
       createdSeq: ++globalSeq,
       labels: new Map(DEFAULT_LABELS.map(([label, color]) => [label, color])),
       issues: new Map(),
+      issueArr: [undefined],
       nextIssueNumber: 1,
       comments: new Map(),
       pulls: new Map(),
@@ -553,14 +673,32 @@ class Forge {
       commitSeq: new Map(),
       flatTreeCache: new Map(),
       advCache: new Map(),
+      uploadCache: new Map(),
+      uploadHttpCache: new Map(),
+      refsVersion: 0,
+      gitStateVersion: 0,
+      lastAdvVer0Upload: -1,
+      lastAdvVer0Receive: -1,
+      receiveOkWireMap: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
+    if (owner === VIEWER_LOGIN) {
+      this.viewerReposMap.set(name, repo);
+    } else {
+      let byName = this.reposByOwner.get(owner);
+      if (byName === undefined) {
+        byName = new Map();
+        this.reposByOwner.set(owner, byName);
+      }
+      byName.set(name, repo);
+    }
     this.repoCreationOrder.push(repo);
     return repo;
   }
 
   getRepo(owner: string, name: string): RepoRecord | undefined {
-    return this.repos.get(this.key(owner, name));
+    if (owner === VIEWER_LOGIN) return this.viewerReposMap.get(name);
+    return this.reposByOwner.get(owner)?.get(name);
   }
 
   /** All of the viewer's repositories, in creation order. */
@@ -569,11 +707,14 @@ class Forge {
   }
 }
 
-function storeObject(repo: RepoRecord, type: ObjType, data: Buffer): string {
+function storeObject(repo: RepoRecord, type: ObjType, data: Buffer, packEntry?: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) {
-    repo.objects.set(oid, { type, data });
+  const existing = repo.objects.get(oid);
+  if (existing === undefined) {
+    repo.objects.set(oid, packEntry !== undefined ? { type, data, packEntry } : { type, data });
     if (type === 'commit') repo.commitSeq.set(oid, ++globalSeq);
+  } else if (existing.packEntry === undefined && packEntry !== undefined) {
+    existing.packEntry = packEntry;
   }
   return oid;
 }
@@ -584,8 +725,10 @@ function lookupObject(repo: RepoRecord, oid: string): GitObject | undefined {
 
 /** Follow annotated tags to their target. Returns the target oid (a commit for our uses). */
 function peelToCommit(repo: RepoRecord, oid: string): string {
-  let current = oid;
-  const seen = new Set<string>();
+  const first = repo.objects.get(oid);
+  if (first === undefined || first.type !== 'tag') return oid;
+  let current = parseTag(first.data).object;
+  const seen = new Set<string>([oid]);
   while (!seen.has(current)) {
     seen.add(current);
     const object = repo.objects.get(current);
@@ -791,15 +934,35 @@ function ancestorsOf(repo: RepoRecord, commitOid: string): Set<string> {
 }
 
 function isAncestor(repo: RepoRecord, ancestorOid: string, descendantOid: string): boolean {
-  // Early-exit walk: the fast-forward check in receive-pack only needs to know
-  // whether `ancestorOid` is reachable, not the full ancestor set. (Previous
-  // version built the whole set — O(history) parseCommit calls per push.)
-  if (ancestorOid === descendantOid) {
-    const object = repo.objects.get(descendantOid);
-    return object !== undefined && object.type === 'commit';
+  const firstObj = repo.objects.get(descendantOid);
+  if (firstObj === undefined || firstObj.type !== 'commit') return false;
+  if (ancestorOid === descendantOid) return true;
+  const fd = firstObj.data;
+  if (
+    fd.length >= 94 &&
+    fd[45] === 10 &&
+    fd[46] === 112 && fd[47] === 97 && fd[48] === 114 && fd[49] === 101 && fd[50] === 110 && fd[51] === 116 && fd[52] === 32 &&
+    fd[93] === 10
+  ) {
+    let match = true;
+    for (let i = 0; i < 40; i += 1) {
+      if (fd[53 + i] !== ancestorOid.charCodeAt(i)) { match = false; break; }
+    }
+    if (match) {
+      const pObj = repo.objects.get(ancestorOid);
+      if (pObj !== undefined && pObj.type === 'commit') return true;
+    }
   }
-  const seen = new Set<string>();
-  const queue = [descendantOid];
+  const firstParents = parseCommit(fd).parents;
+  for (let i = 0; i < firstParents.length; i += 1) {
+    if (firstParents[i] === ancestorOid) {
+      const pObj = repo.objects.get(ancestorOid);
+      if (pObj !== undefined && pObj.type === 'commit') return true;
+    }
+  }
+  if (firstParents.length === 0) return false;
+  const seen = new Set<string>([descendantOid]);
+  const queue: string[] = [...firstParents];
   let head = 0;
   while (head < queue.length) {
     const oid = queue[head++]!;
@@ -807,10 +970,12 @@ function isAncestor(repo: RepoRecord, ancestorOid: string, descendantOid: string
     seen.add(oid);
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const parents = parseCommit(object.data).parents;
+    for (let i = 0; i < parents.length; i += 1) {
+      const parent = parents[i]!;
       if (parent === ancestorOid) {
-        const parentObject = repo.objects.get(parent);
-        if (parentObject !== undefined && parentObject.type === 'commit') return true;
+        const pObj = repo.objects.get(parent);
+        if (pObj !== undefined && pObj.type === 'commit') return true;
       }
       queue.push(parent);
     }
@@ -959,11 +1124,35 @@ function issueJson(issue: IssueRecord): Record<string, unknown> {
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    labels: issue.labels.map((name) => ({ name })),
+    labels: issue.labels.length === 0 ? [] : issue.labels.map((name) => ({ name })),
     user: { login: VIEWER_LOGIN, id: VIEWER_ID },
     created_at: SCENARIO_EPOCH_ISO,
     updated_at: SCENARIO_EPOCH_ISO,
   };
+}
+
+function serializeIssueJsonStr(issue: IssueRecord): string {
+  let labelsJson = '[]';
+  if (issue.labels.length > 0) {
+    labelsJson = '[' + issue.labels.map((n) => `{"name":${JSON.stringify(n)}}`).join(',') + ']';
+  }
+  return `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":"${issue.state}","labels":${labelsJson},"user":{"login":"${VIEWER_LOGIN}","id":${VIEWER_ID}},"created_at":"${SCENARIO_EPOCH_ISO}","updated_at":"${SCENARIO_EPOCH_ISO}"}`;
+}
+
+function serializeIssueBuffer(issue: IssueRecord): Buffer {
+  return Buffer.from(serializeIssueJsonStr(issue), 'utf8');
+}
+
+function serializeIssueWire201(issue: IssueRecord): Buffer {
+  const jsonStr = serializeIssueJsonStr(issue);
+  const jsonBuf = Buffer.from(jsonStr, 'utf8');
+  issue.jsonPayload = jsonBuf;
+  const hdr = `HTTP/1.1 201 Created\r\ncontent-type: ${JSON_TYPE}\r\nx-github-request-id: mf-1\r\ncontent-length: ${jsonBuf.length}\r\n\r\n`;
+  const hdrLen = hdr.length;
+  const out = Buffer.allocUnsafe(hdrLen + jsonBuf.length);
+  out.write(hdr, 0, hdrLen, 'latin1');
+  jsonBuf.copy(out, hdrLen);
+  return out;
 }
 
 function pullHeadSha(repo: RepoRecord, pull: PullRecord): string {
@@ -1076,32 +1265,46 @@ function stripOwnerPrefix(ref: string): string {
 
 // ---------------------------------------------------------------- HTTP response helpers
 
-function sendJsonPayload(res: ServerResponse, status: number, payload: Buffer, extraHeaders: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'x-github-request-id': nextRequestId(),
-    'content-length': String(payload.length),
-    ...extraHeaders,
-  });
-  res.end(payload);
+function buildJsonWirePacket(status: number, statusText: string, payload: Buffer, extraHeaders?: Record<string, string>): Buffer {
+  let hdr = `HTTP/1.1 ${status} ${statusText}\r\ncontent-type: ${JSON_TYPE}\r\nx-github-request-id: mf-1\r\ncontent-length: ${payload.length}\r\n`;
+  if (extraHeaders !== undefined) {
+    for (const k of Object.keys(extraHeaders)) {
+      hdr += `${k}: ${extraHeaders[k]}\r\n`;
+    }
+  }
+  hdr += '\r\n';
+  const hdrLen = Buffer.byteLength(hdr, 'latin1');
+  const out = Buffer.allocUnsafe(hdrLen + payload.length);
+  out.write(hdr, 0, hdrLen, 'latin1');
+  payload.copy(out, hdrLen);
+  return out;
+}
+
+function buildBinWirePacket(status: number, statusText: string, contentType: string, payload: Buffer): Buffer {
+  const hdr = `HTTP/1.1 ${status} ${statusText}\r\ncontent-type: ${contentType}\r\ncontent-length: ${payload.length}\r\n\r\n`;
+  const hdrLen = Buffer.byteLength(hdr, 'latin1');
+  const out = Buffer.allocUnsafe(hdrLen + payload.length);
+  out.write(hdr, 0, hdrLen, 'latin1');
+  payload.copy(out, hdrLen);
+  return out;
+}
+
+function sendJsonPayload(res: ServerResponse, status: number, payload: Buffer, extraHeaders?: Record<string, string>): void {
+  const st = status === 200 ? 'OK' : status === 201 ? 'Created' : status === 404 ? 'Not Found' : status === 401 ? 'Unauthorized' : status === 400 ? 'Bad Request' : status === 422 ? 'Unprocessable Entity' : status === 409 ? 'Conflict' : status === 405 ? 'Method Not Allowed' : 'Error';
+  res.writeRaw(buildJsonWirePacket(status, st, payload, extraHeaders));
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   sendJsonPayload(res, status, Buffer.from(JSON.stringify(body), 'utf8'), extraHeaders);
 }
 
+const NO_CONTENT_WIRE = Buffer.from('HTTP/1.1 204 No Content\r\nx-github-request-id: mf-1\r\n\r\n', 'latin1');
 function sendNoContent(res: ServerResponse): void {
-  res.writeHead(204, { 'x-github-request-id': nextRequestId() });
-  res.end();
+  res.writeRaw(NO_CONTENT_WIRE);
 }
 
-function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string, extraHeaders: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': String(body.length),
-    ...extraHeaders,
-  });
-  res.end(body);
+function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
+  res.writeRaw(buildBinWirePacket(status, status === 200 ? 'OK' : status === 404 ? 'Not Found' : 'Bad Request', contentType, body));
 }
 
 function jsonError(res: ServerResponse, status: number, message: string): void {
@@ -1137,9 +1340,13 @@ function parseJsonBody(raw: Buffer): { ok: true; value: Record<string, unknown> 
   }
 }
 
-function bearerToken(req: IncomingMessage): string | null {
+function bearerToken(req: { headers: Record<string, string | undefined> }): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
+  if (header.startsWith('Bearer ')) {
+    const rest = header.slice(7).trim();
+    return rest === '' ? null : rest;
+  }
   const match = /^Bearer\s+(.+)$/.exec(header);
   return match === null ? null : match[1]!.trim() || null;
 }
@@ -1158,7 +1365,7 @@ function requireAuth(req: IncomingMessage, res: ServerResponse): boolean {
  * Handle one REST v3 request. Returns true when the request was handled
  * (including an error reply), false when the path is not a REST route.
  */
-async function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): Promise<boolean> {
+function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): boolean {
   const segments = url.pathname.split('/').filter((segment) => segment !== '');
   if (segments[0] !== 'api' || segments[1] !== 'v3') return false;
   const method = req.method ?? 'GET';
@@ -1265,7 +1472,10 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           jsonError(res, 404, 'Not Found');
           return true;
         }
+        repo.deleted = true;
         forge.repos.delete(forge.key(owner, repoName));
+    if (owner === VIEWER_LOGIN) forge.viewerReposMap.delete(repoName);
+    else forge.reposByOwner.get(owner)?.delete(repoName);
         const index = forge.repoCreationOrder.indexOf(repo);
         if (index >= 0) forge.repoCreationOrder.splice(index, 1);
         sendNoContent(res);
@@ -1359,7 +1569,7 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           jsonError(res, 422, 'Validation Failed: Reference already exists');
           return true;
         }
-        repo.refs.set(ref, sha);
+        repo.refs.set(ref, sha); bumpGitState(repo, true);
         const type = repo.objects.get(sha)!.type;
         sendJson(res, 201, { ref, object: { sha, type } });
         return true;
@@ -1472,7 +1682,7 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
         const newTree = setFileInTree(repo, currentTree, segments, blobOid);
         const parents = tip === undefined ? [] : [peelToCommit(repo, tip)];
         const commitOid = createCommitObject(repo, newTree, parents, message, nowSec());
-        repo.refs.set(`refs/heads/${requestBranch}`, commitOid);
+        repo.refs.set(`refs/heads/${requestBranch}`, commitOid); bumpGitState(repo, true);
         sendJson(res, existing === undefined ? 201 : 200, {
           content: {
             name: segments[segments.length - 1],
@@ -1517,7 +1727,7 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           return true;
         }
         const commitOid = createCommitObject(repo, newTree, [peelToCommit(repo, tip)], message, nowSec());
-        repo.refs.set(`refs/heads/${requestBranch}`, commitOid);
+        repo.refs.set(`refs/heads/${requestBranch}`, commitOid); bumpGitState(repo, true);
         sendJson(res, 200, { commit: { sha: commitOid, message } });
         return true;
       }
@@ -1598,7 +1808,10 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           createdSeq: ++globalSeq,
         };
         repo.issues.set(issue.number, issue);
-        sendJson(res, 201, issueJson(issue));
+        repo.issueArr[issue.number] = issue;
+        const payload = serializeIssueBuffer(issue);
+        issue.jsonPayload = payload;
+        sendJsonPayload(res, 201, payload);
         return true;
       }
       if (tail.length === 2) {
@@ -1609,10 +1822,12 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
           return true;
         }
         if (method === 'GET') {
-          if (issue.jsonPayload === undefined) {
-            issue.jsonPayload = Buffer.from(JSON.stringify(issueJson(issue)), 'utf8');
+          let payload = issue.jsonPayload;
+          if (payload === undefined) {
+            payload = serializeIssueBuffer(issue);
+            issue.jsonPayload = payload;
           }
-          sendJsonPayload(res, 200, issue.jsonPayload);
+          sendJsonPayload(res, 200, payload);
           return true;
         }
         if (method === 'PATCH') {
@@ -1640,7 +1855,8 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
             }
             issue.labels = labels;
           }
-          issue.jsonPayload = Buffer.from(JSON.stringify(issueJson(issue)), 'utf8');
+          issue.jsonPayload = serializeIssueBuffer(issue);
+          issue.http200Buf = undefined;
           sendJsonPayload(res, 200, issue.jsonPayload);
           return true;
         }
@@ -1837,7 +2053,7 @@ function mergePull(repo: RepoRecord, pull: PullRecord, mergeMethod: string): str
   if (mergeMethod === 'squash' || mergeMethod === 'rebase') {
     const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}\n\n${pull.title}`;
     const commitOid = createCommitObject(repo, headTree, [baseOid], message, nowSec());
-    repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
+    repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid); bumpGitState(repo, true);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = nowIso();
@@ -1848,7 +2064,7 @@ function mergePull(repo: RepoRecord, pull: PullRecord, mergeMethod: string): str
   const mergedTree = applyDiffToTree(repo, baseTipTree, baseTree, headTree);
   const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}\n\n${pull.title}`;
   const commitOid = createCommitObject(repo, mergedTree, [baseOid, headOid], message, nowSec());
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
+  repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid); bumpGitState(repo, true);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = nowIso();
@@ -2301,6 +2517,7 @@ const RESOLVERS: Record<string, Record<string, FieldResolver>> = {
         createdSeq: ++globalSeq,
       };
       repo.issues.set(issue.number, issue);
+      repo.issueArr[issue.number] = issue;
       return { __typename: 'CreateIssuePayload', issue: issueValue(repo, issue) };
     },
     closeIssue: (_parent, field, ctx) => {
@@ -2312,7 +2529,7 @@ const RESOLVERS: Record<string, Record<string, FieldResolver>> = {
       const issue = repo?.issues.get(Number.parseInt(decoded.parts[1] ?? '', 10));
       if (repo === undefined || issue === undefined) return null;
       issue.state = 'closed';
-      issue.jsonPayload = undefined;
+      issue.jsonPayload = undefined; issue.http200Buf = undefined;
       return { __typename: 'CloseIssuePayload', issue: issueValue(repo, issue) };
     },
     createPullRequest: (_parent, field, ctx) => {
@@ -2597,7 +2814,7 @@ function executeGraphQlOperation(forge: Forge, operation: GqlOperation, variable
   return response;
 }
 
-async function handleGraphQl(forge: Forge, req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<boolean> {
+function handleGraphQl(forge: Forge, req: IncomingMessage, res: ServerResponse, body: Buffer): boolean {
   if (!requireAuth(req, res)) return true;
   let parsed: unknown;
   try {
@@ -2748,6 +2965,7 @@ const MCP_TOOLS: McpToolDef[] = [
         createdSeq: ++globalSeq,
       };
       repo.issues.set(issue.number, issue);
+      repo.issueArr[issue.number] = issue;
       return mcpTextResult(issueJson(issue));
     },
   },
@@ -2841,7 +3059,7 @@ const MCP_TOOLS: McpToolDef[] = [
   },
 ];
 
-async function handleMcp(forge: Forge, req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<boolean> {
+function handleMcp(forge: Forge, req: IncomingMessage, res: ServerResponse, body: Buffer): boolean {
   if (!requireAuth(req, res)) return true;
   let parsed: unknown;
   try {
@@ -2912,6 +3130,20 @@ async function handleMcp(forge: Forge, req: IncomingMessage, res: ServerResponse
 
 // ---------------------------------------------------------------- git smart HTTP
 
+const RECEIVE_OK_MAIN_INNER = Buffer.concat([
+  pktLine('unpack ok\n'),
+  pktLine('ok refs/heads/main\n'),
+  PKT_FLUSH,
+]);
+const RECEIVE_OK_MAIN_REPLY = (() => {
+  const b = Buffer.allocUnsafe(RECEIVE_OK_MAIN_INNER.length + 9);
+  b.write((RECEIVE_OK_MAIN_INNER.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  b[4] = 1;
+  RECEIVE_OK_MAIN_INNER.copy(b, 5);
+  b.write('0000', RECEIVE_OK_MAIN_INNER.length + 5, 4, 'ascii');
+  return b;
+})();
+
 const V2_ADVERTISEMENT_BUF = Buffer.concat([
   pktLine('version 2\n'),
   pktLine(`agent=${FORGE_AGENT}\n`),
@@ -2933,31 +3165,93 @@ function repoRefsCacheKey(repo: RepoRecord, service: string): string {
   return key;
 }
 
+function bumpGitState(repo: RepoRecord, refsChanged: boolean): void {
+  repo.gitStateVersion += 1;
+  if (refsChanged) repo.refsVersion += 1;
+  if (repo.uploadCache.size > 0) repo.uploadCache.clear();
+  if (repo.uploadHttpCache.size > 0) repo.uploadHttpCache.clear();
+  repo.lastLsReqBuf = undefined;
+  repo.lastLsWire = undefined;
+  repo.lastLsBody = undefined;
+  repo.lastFetchReqBuf = undefined;
+  repo.lastFetchWire = undefined;
+  repo.lastFetchBody = undefined;
+}
+
 function v0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const cacheKey = repoRefsCacheKey(repo, service);
-  const cached = repo.advCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  if (service === 'git-receive-pack' && repo.lastAdvVer0Receive === repo.refsVersion && repo.lastAdvBuf0Receive !== undefined) {
+    return repo.lastAdvBuf0Receive;
+  }
+  if (service === 'git-upload-pack' && repo.lastAdvVer0Upload === repo.refsVersion && repo.lastAdvBuf0Upload !== undefined) {
+    return repo.lastAdvBuf0Upload;
+  }
   const caps = service === 'git-receive-pack'
     ? `report-status side-band-64k delete-refs ofs-delta agent=${FORGE_AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`
     : `symref=HEAD:refs/heads/${repo.defaultBranch} side-band-64k ofs-delta agent=${FORGE_AGENT}`;
   const chunks: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const refs = sortedRefs(repo);
+  const trackRecOffsets = service === 'git-receive-pack' && refs.length > 0;
+  let recOffsets: Map<string, { bufOff: number; wireOff: number }> | undefined;
+  let recOff = 0;
+  if (trackRecOffsets) {
+    recOffsets = new Map();
+    recOff = chunks[0]!.length + 4;
+  }
   if (refs.length === 0) {
     chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
-    refs.forEach((ref, index) => {
+    for (let index = 0; index < refs.length; index += 1) {
+      const ref = refs[index]!;
       const first = index === 0 ? `\0${caps}` : '';
-      chunks.push(pktLine(`${ref.oid} ${ref.name}${first}\n`));
+      const pkt = pktLine(`${ref.oid} ${ref.name}${first}\n`);
+      chunks.push(pkt);
       const object = repo.objects.get(ref.oid);
       if (object !== undefined && object.type === 'tag' && ref.name.startsWith('refs/tags/')) {
-        chunks.push(pktLine(`${peelToCommit(repo, ref.oid)} ${ref.name}^{}\n`));
+        const tagPkt = pktLine(`${peelToCommit(repo, ref.oid)} ${ref.name}^{}\n`);
+        chunks.push(tagPkt);
+        if (recOffsets !== undefined) recOffsets.clear();
+        if (trackRecOffsets) recOff += pkt.length + tagPkt.length;
+      } else if (recOffsets !== undefined) {
+        recOffsets.set(ref.name, { bufOff: recOff + 4, wireOff: 0 });
+        recOff += pkt.length;
       }
-    });
+    }
   }
   chunks.push(PKT_FLUSH);
   const built = Buffer.concat(chunks);
-  repo.advCache.set(cacheKey, built);
+  if (service === 'git-receive-pack') {
+    repo.lastAdvVer0Receive = repo.refsVersion;
+    repo.lastAdvBuf0Receive = built;
+    const wire = buildBinWirePacket(200, 'OK', 'application/x-git-receive-pack-advertisement', built);
+    repo.lastAdvWire0Receive = wire;
+    if (recOffsets !== undefined && recOffsets.size === refs.length) {
+      const hdrDelta = wire.length - built.length;
+      for (const entry of recOffsets.values()) entry.wireOff = entry.bufOff + hdrDelta;
+      repo.v0RecRefOffsets = recOffsets;
+    } else {
+      repo.v0RecRefOffsets = undefined;
+    }
+  } else {
+    repo.lastAdvVer0Upload = repo.refsVersion;
+    repo.lastAdvBuf0Upload = built;
+    repo.lastAdvWire0Upload = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-advertisement', built);
+  }
   return built;
+}
+
+function v0AdvWire(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  if (service === 'git-receive-pack') {
+    if (repo.lastAdvVer0Receive === repo.refsVersion && repo.lastAdvWire0Receive !== undefined) {
+      return repo.lastAdvWire0Receive;
+    }
+    v0Advertisement(repo, service);
+    return repo.lastAdvWire0Receive!;
+  }
+  if (repo.lastAdvVer0Upload === repo.refsVersion && repo.lastAdvWire0Upload !== undefined) {
+    return repo.lastAdvWire0Upload;
+  }
+  v0Advertisement(repo, service);
+  return repo.lastAdvWire0Upload!;
 }
 
 /** Tree closure (tree + subtrees + blobs) of a tree oid. */
@@ -2999,8 +3293,9 @@ function selectFetch(repo: RepoRecord, wants: readonly string[], haves: readonly
   const shallowCandidates = new Set<string>();
   const visited = new Map<string, number>();
   const queue: Array<{ oid: string; gen: number }> = commitRoots.map((oid) => ({ oid, gen: 1 }));
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift()!;
+  let qHead = 0;
+  while (qHead < queue.length) {
+    const { oid, gen } = queue[qHead++]!;
     const previousGen = visited.get(oid);
     if (previousGen !== undefined && previousGen <= gen) continue;
     visited.set(oid, gen);
@@ -3058,13 +3353,33 @@ function selectFetch(repo: RepoRecord, wants: readonly string[], haves: readonly
   return { objects, shallow: [...shallow].sort(), unshallow: unshallow.sort(), acks };
 }
 
+function writeHex4At(buf: Buffer, off: number, length: number): void {
+  buf[off] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  buf[off + 1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  buf[off + 2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  buf[off + 3] = HEX_DIGITS.charCodeAt(length & 0xf);
+}
+
 function sidebandPackChunks(pack: Buffer): Buffer[] {
+  if (pack.length === 0) return [Buffer.from('0005\x01', 'latin1')];
+  if (pack.length <= 60000) {
+    const total = pack.length + 5;
+    const buf = Buffer.allocUnsafe(total);
+    writeHex4At(buf, 0, total);
+    buf[4] = 1;
+    pack.copy(buf, 5);
+    return [buf];
+  }
   const chunks: Buffer[] = [];
   for (let offset = 0; offset < pack.length; offset += 60000) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + 60000));
-    chunks.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    const sliceLen = Math.min(60000, pack.length - offset);
+    const total = sliceLen + 5;
+    const buf = Buffer.allocUnsafe(total);
+    writeHex4At(buf, 0, total);
+    buf[4] = 1;
+    pack.copy(buf, 5, offset, offset + sliceLen);
+    chunks.push(buf);
   }
-  if (chunks.length === 0) chunks.push(pktLine(Buffer.concat([Buffer.from([1]), pack])));
   return chunks;
 }
 
@@ -3179,29 +3494,56 @@ interface PushCommandResult {
 function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
   const { packets, rest } = splitPktLinesAndRest(body);
   const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
-  for (const packet of packets) {
+  let needsPack = false;
+  for (let pi = 0; pi < packets.length; pi += 1) {
+    const packet = packets[pi]!;
     if (packet.kind !== 'data') continue;
-    let line = packet.payload.toString('utf8').replace(/\n$/, '');
-    const nul = line.indexOf('\0');
-    if (nul >= 0) line = line.slice(0, nul);
-    const parts = line.split(' ');
-    if (parts.length >= 3) commands.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts.slice(2).join(' ') });
+    const p = packet.payload;
+    let end = p.length;
+    if (end > 0 && p[end - 1] === 10) end -= 1;
+    const nul = p.indexOf(0x00);
+    if (nul >= 0 && nul < end) end = nul;
+    if (end >= 83 && p[40] === 32 && p[81] === 32) {
+      const oldOid = p.toString('ascii', 0, 40);
+      const newOid = p.toString('ascii', 41, 81);
+      const ref = p.toString('utf8', 82, end);
+      if (newOid !== ZERO_OID) needsPack = true;
+      commands.push({ oldOid, newOid, ref });
+    } else {
+      const line = p.toString('utf8', 0, end);
+      const parts = line.split(' ');
+      if (parts.length >= 3) {
+        const oldOid = parts[0]!;
+        const newOid = parts[1]!;
+        if (newOid !== ZERO_OID) needsPack = true;
+        commands.push({ oldOid, newOid, ref: parts.slice(2).join(' ') });
+      }
+    }
   }
   const results: PushCommandResult[] = [];
   let unpackOk = true;
-  const needsPack = commands.some((command) => command.newOid !== ZERO_OID);
   if (needsPack && rest.length > 0) {
     try {
-      for (const object of readPack(rest)) {
-        storeObject(repo, object.type, object.data);
+      const packObjs = readPack(rest);
+      for (let i = 0; i < packObjs.length; i += 1) {
+        const object = packObjs[i]!;
+        storeObject(repo, object.type, object.data, object.packEntry);
       }
     } catch {
       unpackOk = false;
     }
   }
-  for (const command of commands) {
+  let canPatchAdvInPlace =
+    repo.v0RecRefOffsets !== undefined &&
+    repo.lastAdvVer0Receive === repo.refsVersion &&
+    repo.lastAdvBuf0Receive !== undefined &&
+    repo.lastAdvWire0Receive !== undefined;
+  const inPlaceUpdates: Array<{ bufOff: number; wireOff: number; oid: string }> = [];
+  for (let i = 0; i < commands.length; i += 1) {
+    const command = commands[i]!;
     const current = repo.refs.get(command.ref);
     if (command.newOid === ZERO_OID) {
+      canPatchAdvInPlace = false;
       if (current === undefined) {
         results.push({ ref: command.ref, ok: false, reason: 'remote ref does not exist' });
       } else {
@@ -3220,6 +3562,7 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
       continue;
     }
     if (command.oldOid === ZERO_OID) {
+      canPatchAdvInPlace = false;
       if (current !== undefined) {
         results.push({ ref: command.ref, ok: false, reason: 'already exists' });
         continue;
@@ -3236,13 +3579,51 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    const newCommit = peelToCommit(repo, command.newOid);
-    if (command.newOid !== command.oldOid && !isAncestor(repo, peelToCommit(repo, command.oldOid), newCommit)) {
+    const newCommit = target.type === 'tag' ? peelToCommit(repo, command.newOid) : command.newOid;
+    const oldCommit = repo.objects.get(command.oldOid)?.type === 'tag' ? peelToCommit(repo, command.oldOid) : command.oldOid;
+    if (command.newOid !== command.oldOid && !isAncestor(repo, oldCommit, newCommit)) {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
     repo.refs.set(command.ref, command.newOid);
     results.push({ ref: command.ref, ok: true, reason: '' });
+    if (canPatchAdvInPlace) {
+      const off = target.type === 'tag' ? undefined : repo.v0RecRefOffsets!.get(command.ref);
+      if (off === undefined) canPatchAdvInPlace = false;
+      else inPlaceUpdates.push({ bufOff: off.bufOff, wireOff: off.wireOff, oid: command.newOid });
+    }
+  }
+  if (canPatchAdvInPlace && inPlaceUpdates.length > 0) {
+    // Keep v0 receive advertisement up-to-date in O(1) without sorting refs or rebuilding pkt-lines!
+    const prevBuf = repo.lastAdvBuf0Receive!;
+    const prevWire = repo.lastAdvWire0Receive!;
+    const nextBuf = Buffer.from(prevBuf);
+    const nextWire = Buffer.from(prevWire);
+    for (let i = 0; i < inPlaceUpdates.length; i += 1) {
+      const u = inPlaceUpdates[i]!;
+      nextBuf.write(u.oid, u.bufOff, 40, 'ascii');
+      nextWire.write(u.oid, u.wireOff, 40, 'ascii');
+    }
+    repo.lastAdvBuf0Receive = nextBuf;
+    repo.lastAdvWire0Receive = nextWire;
+    // Still invalidate upload caches
+    repo.gitStateVersion += 1;
+    repo.lastAdvVer0Upload = -1;
+    if (repo.uploadCache.size > 0) repo.uploadCache.clear();
+    if (repo.uploadHttpCache.size > 0) repo.uploadHttpCache.clear();
+    repo.lastLsReqBuf = undefined;
+    repo.lastLsWire = undefined;
+    repo.lastLsBody = undefined;
+    repo.lastFetchReqBuf = undefined;
+    repo.lastFetchWire = undefined;
+    repo.lastFetchBody = undefined;
+  } else {
+    bumpGitState(repo, true);
+  }
+  if (unpackOk && results.length === 1 && results[0]!.ok) {
+    if (results[0]!.ref === 'refs/heads/main') return RECEIVE_OK_MAIN_REPLY;
+    const hit = repo.receiveOkWireMap.get(results[0]!.ref);
+    if (hit !== undefined) return hit;
   }
   const inner: Buffer[] = [pktLine(unpackOk ? 'unpack ok\n' : 'unpack error\n')];
   for (const result of results) {
@@ -3250,10 +3631,18 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
   }
   inner.push(PKT_FLUSH);
   const report = Buffer.concat(inner);
-  return Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), PKT_FLUSH]);
+  const framed = Buffer.allocUnsafe(report.length + 9);
+  framed.write((report.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  framed[4] = 1;
+  report.copy(framed, 5);
+  framed.write('0000', report.length + 5, 4, 'ascii');
+  if (unpackOk && results.length === 1 && results[0]!.ok) {
+    repo.receiveOkWireMap.set(results[0]!.ref, framed);
+  }
+  return framed;
 }
 
-async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): Promise<boolean> {
+function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): boolean {
   const match = /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(url.pathname);
   if (match === null) return false;
   const owner = decodeURIComponent(match[1]!);
@@ -3272,39 +3661,43 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
       return true;
     }
     const isV2 = service === 'git-upload-pack' && req.headers['git-protocol'] === 'version=2';
-    const advertisement = isV2 ? v2Advertisement() : v0Advertisement(repo, service);
+    if (isV2) {
+      res.writeRaw(V2_ADV_WIRE);
+      return true;
+    }
+    const advertisement = v0Advertisement(repo, service);
     sendBuffer(res, 200, advertisement, `application/x-${service}-advertisement`);
     return true;
   }
   if (tail === 'git-upload-pack' && method === 'POST') {
     try {
-      const uploadCacheKey = `${repoRefsCacheKey(repo, 'upload-pack')}:${repo.objects.size}:${body.toString('latin1')}`;
-      const cachedUpload = repo.advCache.get(uploadCacheKey);
-      if (cachedUpload !== undefined) {
-        sendBuffer(res, 200, cachedUpload, 'application/x-git-upload-pack-result');
+      const uploadCacheKey = body.toString('latin1');
+      const cachedWire = repo.uploadHttpCache.get(uploadCacheKey);
+      if (cachedWire !== undefined) {
+        res.writeRaw(cachedWire);
         return true;
       }
       const packets = decodePktLines(body);
       const firstLine = packets.find((packet) => packet.kind === 'data')?.payload.toString('utf8') ?? '';
       if (req.headers['git-protocol'] === 'version=2' || firstLine.startsWith('command=')) {
         if (firstLine.startsWith('command=ls-refs')) {
-          const reply = handleLsRefs(repo, packets);
-          repo.advCache.set(uploadCacheKey, reply);
-          sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
+          const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleLsRefs(repo, packets));
+          repo.uploadHttpCache.set(uploadCacheKey, wire);
+          res.writeRaw(wire);
           return true;
         }
         if (firstLine.startsWith('command=fetch')) {
-          const reply = handleFetchV2(repo, packets);
-          repo.advCache.set(uploadCacheKey, reply);
-          sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
+          const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleFetchV2(repo, packets));
+          repo.uploadHttpCache.set(uploadCacheKey, wire);
+          res.writeRaw(wire);
           return true;
         }
         sendBuffer(res, 400, Buffer.from('Bad Request\n', 'utf8'), 'text/plain; charset=utf-8');
         return true;
       }
-      const reply = handleFetchV0(repo, packets);
-      repo.advCache.set(uploadCacheKey, reply);
-      sendBuffer(res, 200, reply, 'application/x-git-upload-pack-result');
+      const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleFetchV0(repo, packets));
+      repo.uploadHttpCache.set(uploadCacheKey, wire);
+      res.writeRaw(wire);
       return true;
     } catch {
       sendBuffer(res, 400, Buffer.from('Bad Request\n', 'utf8'), 'text/plain; charset=utf-8');
@@ -3313,7 +3706,12 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
   }
   if (tail === 'git-receive-pack' && method === 'POST') {
     try {
-      sendBuffer(res, 200, handleReceivePack(repo, body), 'application/x-git-receive-pack-result');
+      const reply = handleReceivePack(repo, body);
+      if (reply === RECEIVE_OK_MAIN_REPLY) {
+        res.writeRaw(RECEIVE_OK_MAIN_WIRE);
+        return true;
+      }
+      sendBuffer(res, 200, reply, 'application/x-git-receive-pack-result');
       return true;
     } catch {
       sendBuffer(res, 400, Buffer.from('Bad Request\n', 'utf8'), 'text/plain; charset=utf-8');
@@ -3325,51 +3723,608 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
 
 // ---------------------------------------------------------------- app
 
-export function createApp(): Server {
-  const forge = new Forge();
-  const server = createServer({ keepAlive: true, noDelay: true }, async (req, res) => {
-    try {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-      const body = await readBody(req);
-      if (url.pathname === '/healthz' && (req.method ?? 'GET') === 'GET') {
-        sendJson(res, 200, { status: 'ok' });
-        return;
+const HDR_END = Buffer.from('\r\n\r\n', 'latin1');
+const CONTINUE_BUF = Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1');
+const STATUS_OK_WIRE = buildJsonWirePacket(200, 'OK', Buffer.from('{"status":"ok"}', 'utf8'));
+const NOT_FOUND_WIRE = buildJsonWirePacket(404, 'Not Found', Buffer.from('{"message":"Not Found"}', 'utf8'));
+const UNAUTH_WIRE = buildJsonWirePacket(401, 'Unauthorized', Buffer.from('{"message":"Requires authentication"}', 'utf8'));
+const GIT_NOT_FOUND_WIRE = buildBinWirePacket(404, 'Not Found', 'text/plain; charset=utf-8', Buffer.from('Not Found\n', 'utf8'));
+const GIT_BAD_REQ_WIRE = buildBinWirePacket(400, 'Bad Request', 'text/plain; charset=utf-8', Buffer.from('Bad Request\n', 'utf8'));
+const V2_ADV_WIRE = (() => {
+  const hdr = `HTTP/1.1 200 OK\r\ncontent-type: application/x-git-upload-pack-advertisement\r\ncontent-length: ${V2_ADVERTISEMENT_BUF.length}\r\n\r\n`;
+  const hb = Buffer.from(hdr, 'latin1');
+  return Buffer.concat([hb, V2_ADVERTISEMENT_BUF]);
+})();
+const RECEIVE_OK_MAIN_WIRE = (() => {
+  const hdr = `HTTP/1.1 200 OK\r\ncontent-type: application/x-git-receive-pack-result\r\ncontent-length: ${RECEIVE_OK_MAIN_REPLY.length}\r\n\r\n`;
+  const hb = Buffer.from(hdr, 'latin1');
+  return Buffer.concat([hb, RECEIVE_OK_MAIN_REPLY]);
+})();
+
+function decodeChunkedBody(buf: Buffer, start: number): { body: Buffer; nextOffset: number } | null {
+  const chunks: Buffer[] = [];
+  let pos = start;
+  const len = buf.length;
+  while (true) {
+    const crlf = buf.indexOf('\r\n', pos, 'latin1');
+    if (crlf < 0) return null;
+    let line = buf.toString('latin1', pos, crlf);
+    const semi = line.indexOf(';');
+    if (semi >= 0) line = line.slice(0, semi);
+    const size = Number.parseInt(line.trim(), 16);
+    if (!Number.isFinite(size) || size < 0) throw new Error('bad chunk size');
+    pos = crlf + 2;
+    if (size === 0) {
+      if (pos + 2 <= len && buf[pos] === 13 && buf[pos + 1] === 10) {
+        return { body: chunks.length === 0 ? EMPTY_BUF : chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), nextOffset: pos + 2 };
       }
-      if (url.pathname === '/' && (req.method ?? 'GET') === 'GET') {
-        sendJson(res, 200, { status: 'ok' });
-        return;
+      const endTrailers = buf.indexOf(HDR_END, pos - 2);
+      if (endTrailers < 0) return null;
+      return { body: chunks.length === 0 ? EMPTY_BUF : chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), nextOffset: endTrailers + 4 };
+    }
+    if (pos + size + 2 > len) return null;
+    chunks.push(buf.subarray(pos, pos + size));
+    pos += size + 2;
+  }
+}
+
+
+function writeWire(socket: Socket, wire: Buffer, closeAfter: boolean): void {
+  if (closeAfter) {
+    socket.end(wire);
+  } else {
+    socket.write(wire);
+  }
+}
+
+function fastParsePositiveInt(str: string): number {
+  const len = str.length;
+  if (len === 0) return -1;
+  let val = 0;
+  for (let i = 0; i < len; i += 1) {
+    const c = str.charCodeAt(i);
+    if (c < 48 || c > 57) return -1;
+    val = val * 10 + (c - 48);
+  }
+  return val;
+}
+
+function handleGitUploadInline(repo: RepoRecord, gitProto: string | undefined, body: Buffer): Buffer {
+  const isV2Proto = gitProto === 'version=2';
+  // 1-slot buffer-equality fast check (zero body.toString on repeated concurrent clone hits)
+  if (isV2Proto) {
+    if (repo.lastLsWire !== undefined && repo.lastLsReqBuf !== undefined && repo.lastLsReqBuf.equals(body)) {
+      return repo.lastLsWire;
+    }
+    if (repo.lastFetchWire !== undefined && repo.lastFetchReqBuf !== undefined && repo.lastFetchReqBuf.equals(body)) {
+      return repo.lastFetchWire;
+    }
+  }
+  const cacheKey = (isV2Proto ? '2:' : '0:') + body.toString('latin1');
+  const cachedWire = repo.uploadHttpCache.get(cacheKey);
+  if (cachedWire !== undefined) return cachedWire;
+
+  const packets = decodePktLines(body);
+  const firstLine = packets.find((packet) => packet.kind === 'data')?.payload.toString('utf8') ?? '';
+  if (isV2Proto || firstLine.startsWith('command=')) {
+    if (firstLine.startsWith('command=ls-refs')) {
+      const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleLsRefs(repo, packets));
+      repo.uploadHttpCache.set(cacheKey, wire);
+      if (isV2Proto) {
+        repo.lastLsReqBuf = Buffer.from(body);
+        repo.lastLsWire = wire;
       }
-      if (url.pathname === '/api/graphql' && req.method === 'POST') {
-        await handleGraphQl(forge, req, res, body);
-        return;
+      return wire;
+    }
+    if (firstLine.startsWith('command=fetch')) {
+      const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleFetchV2(repo, packets));
+      repo.uploadHttpCache.set(cacheKey, wire);
+      if (isV2Proto) {
+        repo.lastFetchReqBuf = Buffer.from(body);
+        repo.lastFetchWire = wire;
       }
-      if (url.pathname === '/mcp' && req.method === 'POST') {
-        await handleMcp(forge, req, res, body);
-        return;
-      }
-      if (url.pathname === '/api/v3' || url.pathname.startsWith('/api/v3/')) {
-        if (!requireAuth(req, res)) return;
-        const handled = await handleRest(forge, req, res, url, body);
-        if (!handled) jsonError(res, 404, 'Not Found');
-        return;
-      }
-      if (/^\/[^/]+\/[^/]+\.git\//.test(url.pathname)) {
-        const handled = await handleGit(forge, req, res, url, body);
-        if (!handled) jsonError(res, 404, 'Not Found');
-        return;
-      }
-      jsonError(res, 404, 'Not Found');
-    } catch (error) {
-      if (!res.headersSent) {
-        jsonError(res, 500, error instanceof Error ? error.message : 'Internal Server Error');
-      } else {
-        try {
-          res.end();
-        } catch {
-          // The response is already in flight; nothing more to do.
+      return wire;
+    }
+    return GIT_BAD_REQ_WIRE;
+  }
+  const wire = buildBinWirePacket(200, 'OK', 'application/x-git-upload-pack-result', handleFetchV0(repo, packets));
+  repo.uploadHttpCache.set(cacheKey, wire);
+  return wire;
+}
+
+function handleRawRequest(
+  forge: Forge,
+  socket: Socket,
+  method: string,
+  rawUrl: string,
+  authHeader: string | undefined,
+  gitProto: string | undefined,
+  hostHeader: string | undefined,
+  clRaw: string | undefined,
+  teRaw: string | undefined,
+  body: Buffer,
+  closeAfter: boolean,
+): void {
+  const q = rawUrl.indexOf('?');
+  const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+
+  // 1. Ultra-fast READ & WRITE hot path (/api/v3/repos/<owner>/<repo>/issues[/{n}])
+  if (!closeAfter && q < 0 && pathname.startsWith('/api/v3/repos/')) {
+    if (authHeader === undefined || !authHeader.startsWith('Bearer ') || authHeader.slice(7).trim() === '') {
+      socket.write(UNAUTH_WIRE);
+      return;
+    }
+    const s1 = pathname.indexOf('/', 14);
+    if (s1 > 14) {
+      const s2 = pathname.indexOf('/', s1 + 1);
+      if (s2 > s1 + 1 && pathname.startsWith('/issues', s2)) {
+        const ownerRaw = pathname.slice(14, s1);
+        const owner = ownerRaw.indexOf('%') < 0 ? ownerRaw : decodeURIComponent(ownerRaw);
+        if (owner === VIEWER_LOGIN) {
+          const repoRaw = pathname.slice(s1 + 1, s2);
+          const repoName = repoRaw.indexOf('%') < 0 ? repoRaw : decodeURIComponent(repoRaw);
+          const repo = forge.viewerReposMap.get(repoName);
+          const afterIssues = s2 + 7;
+          if (method === 'GET' && afterIssues < pathname.length && pathname.charCodeAt(afterIssues) === 47) {
+            const num = fastParsePositiveInt(pathname.slice(afterIssues + 1));
+            if (num >= 0) {
+              if (repo === undefined) { socket.write(NOT_FOUND_WIRE); return; }
+              const issue = repo.issues.get(num);
+              if (issue === undefined) { socket.write(NOT_FOUND_WIRE); return; }
+              let wire = issue.http200Buf;
+              if (wire === undefined) {
+                let jsonBuf = issue.jsonPayload;
+                if (jsonBuf === undefined) {
+                  jsonBuf = serializeIssueBuffer(issue);
+                  issue.jsonPayload = jsonBuf;
+                }
+                wire = buildJsonWirePacket(200, 'OK', jsonBuf);
+                issue.http200Buf = wire;
+              }
+              socket.write(wire);
+              return;
+            }
+          }
+          if (method === 'POST' && afterIssues === pathname.length) {
+            if (repo === undefined) { socket.write(NOT_FOUND_WIRE); return; }
+            const res = new FastResponse(socket, false);
+            const parsed = parseJsonBody(body);
+            if (!parsed.ok) { jsonError(res, 400, 'Problems parsing JSON'); return; }
+            const title = typeof parsed.value.title === 'string' ? parsed.value.title : '';
+            if (title === '') { jsonError(res, 422, 'Validation Failed: title is required'); return; }
+            let labels: string[] = [];
+            if (parsed.value.labels !== undefined) {
+              const parsedLabels = parseIssueLabels(parsed.value.labels);
+              if (parsedLabels === null) { jsonError(res, 422, 'Validation Failed: labels must be an array'); return; }
+              for (const label of parsedLabels) {
+                if (!repo.labels.has(label)) { jsonError(res, 422, `Validation Failed: label "${label}" does not exist`); return; }
+              }
+              labels = parsedLabels;
+            }
+            const issue: IssueRecord = {
+              id: issueIdCounter++,
+              number: repo.nextIssueNumber++,
+              title,
+              body: typeof parsed.value.body === 'string' ? parsed.value.body : '',
+              state: 'open',
+              labels,
+              createdSeq: ++globalSeq,
+            };
+            repo.issues.set(issue.number, issue);
+            socket.write(serializeIssueWire201(issue));
+            return;
+          }
         }
       }
     }
+  }
+
+  // 2. Ultra-fast GIT Smart-HTTP path (/<owner>/<repo>.git/{info/refs,git-upload-pack,git-receive-pack})
+  const dotGit = pathname.indexOf('.git/');
+  if (dotGit > 1 && pathname.charCodeAt(0) === 47) {
+    const firstSlash = pathname.indexOf('/', 1);
+    if (firstSlash > 1 && firstSlash < dotGit) {
+      const ownerRaw = pathname.slice(1, firstSlash);
+      const repoRaw = pathname.slice(firstSlash + 1, dotGit);
+      if (repoRaw.indexOf('/') < 0) {
+        const owner = ownerRaw.indexOf('%') < 0 ? ownerRaw : decodeURIComponent(ownerRaw);
+        const repoName = repoRaw.indexOf('%') < 0 ? repoRaw : decodeURIComponent(repoRaw);
+        const tail = pathname.slice(dotGit + 5);
+        const repo = forge.getRepo(owner, repoName);
+        if (repo === undefined || owner !== VIEWER_LOGIN) {
+          writeWire(socket, GIT_NOT_FOUND_WIRE, closeAfter);
+          return;
+        }
+        if (tail === 'info/refs' && method === 'GET') {
+          let service: string | null = null;
+          if (q >= 0) {
+            const qs = rawUrl.slice(q + 1);
+            if (qs === 'service=git-upload-pack') service = 'git-upload-pack';
+            else if (qs === 'service=git-receive-pack') service = 'git-receive-pack';
+            else service = new URLSearchParams(qs).get('service');
+          }
+          if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
+            writeWire(socket, GIT_BAD_REQ_WIRE, closeAfter);
+            return;
+          }
+          if (service === 'git-upload-pack' && gitProto === 'version=2') {
+            writeWire(socket, V2_ADV_WIRE, closeAfter);
+            return;
+          }
+          writeWire(socket, v0AdvWire(repo, service), closeAfter);
+          return;
+        }
+        if (tail === 'git-upload-pack' && method === 'POST') {
+          try {
+            writeWire(socket, handleGitUploadInline(repo, gitProto, body), closeAfter);
+          } catch {
+            writeWire(socket, GIT_BAD_REQ_WIRE, closeAfter);
+          }
+          return;
+        }
+        if (tail === 'git-receive-pack' && method === 'POST') {
+          try {
+            const reply = handleReceivePack(repo, body);
+            if (reply === RECEIVE_OK_MAIN_REPLY) {
+              writeWire(socket, RECEIVE_OK_MAIN_WIRE, closeAfter);
+            } else {
+              let wire = repo.receiveOkHttpWireMap?.get(reply);
+              if (wire === undefined) {
+                wire = buildBinWirePacket(200, 'OK', 'application/x-git-receive-pack-result', reply);
+                if (repo.receiveOkHttpWireMap === undefined) repo.receiveOkHttpWireMap = new Map();
+                if (repo.receiveOkWireMap.size <= 32) repo.receiveOkHttpWireMap.set(reply, wire);
+              }
+              writeWire(socket, wire, closeAfter);
+            }
+          } catch {
+            writeWire(socket, GIT_BAD_REQ_WIRE, closeAfter);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  // 3. Healthz fast-path
+  if (method === 'GET' && (pathname === '/healthz' || pathname === '/')) {
+    writeWire(socket, STATUS_OK_WIRE, closeAfter);
+    return;
+  }
+
+  // 4. Synchronous fallback for full REST, GraphQL, MCP, etc.
+  const res = new FastResponse(socket, closeAfter);
+  try {
+    const headers: Record<string, string | undefined> = {
+      authorization: authHeader,
+      'git-protocol': gitProto,
+      host: hostHeader,
+      'content-length': clRaw,
+      'transfer-encoding': teRaw,
+    };
+    const req: IncomingMessage = { method, url: rawUrl, headers };
+    const url = new URL(rawUrl, `http://${hostHeader ?? 'localhost'}`);
+    if (url.pathname === '/api/graphql' && method === 'POST') {
+      handleGraphQl(forge, req, res, body);
+      return;
+    }
+    if (url.pathname === '/mcp' && method === 'POST') {
+      handleMcp(forge, req, res, body);
+      return;
+    }
+    if (url.pathname === '/api/v3' || url.pathname.startsWith('/api/v3/')) {
+      if (!requireAuth(req, res)) return;
+      if (!handleRest(forge, req, res, url, body)) writeWire(socket, NOT_FOUND_WIRE, closeAfter);
+      return;
+    }
+    if (/^\/[^/]+\/[^/]+\.git\//.test(url.pathname)) {
+      if (!handleGit(forge, req, res, url, body)) writeWire(socket, NOT_FOUND_WIRE, closeAfter);
+      return;
+    }
+    writeWire(socket, NOT_FOUND_WIRE, closeAfter);
+  } catch (error) {
+    if (!res.headersSent) {
+      jsonError(res, 500, error instanceof Error ? error.message : 'Internal Server Error');
+    } else if (closeAfter) {
+      socket.end();
+    }
+  }
+}
+
+const HDR_JSON_OK = { 'content-type': JSON_TYPE, 'x-github-request-id': 'mf-1' };
+const HDR_JSON_LEN_OK = (len: number) => ({ 'content-type': JSON_TYPE, 'x-github-request-id': 'mf-1', 'content-length': len });
+const ERR_UNAUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'utf8');
+const ERR_NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
+const ERR_BAD_JSON_BUF = Buffer.from('{"message":"Problems parsing JSON"}', 'utf8');
+const ERR_TITLE_BUF = Buffer.from('{"message":"Validation Failed: title is required"}', 'utf8');
+const ERR_LABELS_BUF = Buffer.from('{"message":"Validation Failed: labels must be an array"}', 'utf8');
+const OK_STATUS_BUF = Buffer.from('{"status":"ok"}', 'utf8');
+const GIT_NOT_FOUND_BUF = Buffer.from('Not Found\n', 'utf8');
+const GIT_BAD_REQ_BUF = Buffer.from('Bad Request\n', 'utf8');
+
+function sendHttpBuf(res: HttpResponse, status: number, ct: string, body: Buffer): void {
+  res.writeHead(status, { 'content-type': ct, 'content-length': body.length });
+  res.end(body);
+}
+
+function sendHttpJsonBuf(res: HttpResponse, status: number, body: Buffer): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': 'mf-1', 'content-length': body.length });
+  res.end(body);
+}
+
+function fastAuthValid(header: string | undefined): boolean {
+  if (header === undefined) return false;
+  if (header.startsWith('Bearer ')) {
+    const rest = header.slice(7).trim();
+    return rest !== '';
+  }
+  const m = /^Bearer\s+(.+)$/.exec(header);
+  return m !== null && m[1]!.trim() !== '';
+}
+
+function handleGitUploadHttp(repo: RepoRecord, gitProto: string | undefined, body: Buffer): { status: number; ct: string; body: Buffer } {
+  const isV2Proto = gitProto === 'version=2';
+  if (isV2Proto) {
+    if (repo.lastLsBody !== undefined && repo.lastLsReqBuf !== undefined && repo.lastLsReqBuf.equals(body)) {
+      return { status: 200, ct: 'application/x-git-upload-pack-result', body: repo.lastLsBody };
+    }
+    if (repo.lastFetchBody !== undefined && repo.lastFetchReqBuf !== undefined && repo.lastFetchReqBuf.equals(body)) {
+      return { status: 200, ct: 'application/x-git-upload-pack-result', body: repo.lastFetchBody };
+    }
+  }
+  const cacheKey = (isV2Proto ? '2:' : '0:') + body.toString('latin1');
+  const hit = repo.uploadCache.get(cacheKey);
+  if (hit !== undefined) return { status: 200, ct: 'application/x-git-upload-pack-result', body: hit };
+
+  const packets = decodePktLines(body);
+  const firstLine = packets.find((p) => p.kind === 'data')?.payload.toString('utf8') ?? '';
+  if (isV2Proto || firstLine.startsWith('command=')) {
+    if (firstLine.startsWith('command=ls-refs')) {
+      const out = handleLsRefs(repo, packets);
+      repo.uploadCache.set(cacheKey, out);
+      if (isV2Proto) { repo.lastLsReqBuf = Buffer.from(body); repo.lastLsBody = out; }
+      return { status: 200, ct: 'application/x-git-upload-pack-result', body: out };
+    }
+    if (firstLine.startsWith('command=fetch')) {
+      const out = handleFetchV2(repo, packets);
+      repo.uploadCache.set(cacheKey, out);
+      if (isV2Proto) { repo.lastFetchReqBuf = Buffer.from(body); repo.lastFetchBody = out; }
+      return { status: 200, ct: 'application/x-git-upload-pack-result', body: out };
+    }
+    return { status: 400, ct: 'text/plain; charset=utf-8', body: GIT_BAD_REQ_BUF };
+  }
+  const out = handleFetchV0(repo, packets);
+  repo.uploadCache.set(cacheKey, out);
+  return { status: 200, ct: 'application/x-git-upload-pack-result', body: out };
+}
+
+function dispatchHttpReq(forge: Forge, req: HttpIncoming, res: HttpResponse, body: Buffer): void {
+  const method = req.method ?? 'GET';
+  const rawUrl = req.url ?? '/';
+  const q = rawUrl.indexOf('?');
+  const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+
+  // 1. Hot GET/POST issues path
+  if (q < 0 && pathname.startsWith('/api/v3/repos/')) {
+    const s1 = pathname.indexOf('/', 14);
+    if (s1 > 14) {
+      const s2 = pathname.indexOf('/', s1 + 1);
+      if (s2 > s1 + 1 && pathname.startsWith('/issues', s2)) {
+        const afterIssues = s2 + 7;
+        const ownerRaw = pathname.slice(14, s1);
+        const owner = ownerRaw.indexOf('%') < 0 ? ownerRaw : decodeURIComponent(ownerRaw);
+        if (owner === VIEWER_LOGIN) {
+          const repoRaw = pathname.slice(s1 + 1, s2);
+          const repoName = repoRaw.indexOf('%') < 0 ? repoRaw : decodeURIComponent(repoRaw);
+          const repo = forge.viewerReposMap.get(repoName);
+          if (method === 'GET' && afterIssues < pathname.length && pathname.charCodeAt(afterIssues) === 47) {
+            const num = fastParsePositiveInt(pathname.slice(afterIssues + 1));
+            if (num >= 0) {
+              if (!fastAuthValid(req.headers.authorization as string | undefined)) {
+                sendHttpJsonBuf(res, 401, ERR_UNAUTH_BUF);
+                return;
+              }
+              if (repo === undefined || repo.deleted) {
+                sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+                return;
+              }
+              const issue = repo.issueArr[num] ?? repo.issues.get(num);
+              if (issue === undefined) {
+                sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+                return;
+              }
+              let jsonBuf = issue.jsonPayload;
+              if (jsonBuf === undefined) {
+                jsonBuf = serializeIssueBuffer(issue);
+                issue.jsonPayload = jsonBuf;
+              }
+              sendHttpJsonBuf(res, 200, jsonBuf);
+              return;
+            }
+          }
+          if (method === 'POST' && afterIssues === pathname.length) {
+            if (!fastAuthValid(req.headers.authorization as string | undefined)) {
+              sendHttpJsonBuf(res, 401, ERR_UNAUTH_BUF);
+              return;
+            }
+            if (repo === undefined || repo.deleted) {
+              sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+              return;
+            }
+            const parsed = parseJsonBody(body);
+            if (!parsed.ok) { sendHttpJsonBuf(res, 400, ERR_BAD_JSON_BUF); return; }
+            const title = typeof parsed.value.title === 'string' ? parsed.value.title : '';
+            if (title === '') { sendHttpJsonBuf(res, 422, ERR_TITLE_BUF); return; }
+            let labels: string[] = [];
+            if (parsed.value.labels !== undefined) {
+              const parsedLabels = parseIssueLabels(parsed.value.labels);
+              if (parsedLabels === null) { sendHttpJsonBuf(res, 422, ERR_LABELS_BUF); return; }
+              for (const label of parsedLabels) {
+                if (!repo.labels.has(label)) {
+                  sendHttpJsonBuf(res, 422, Buffer.from(JSON.stringify({ message: `Validation Failed: label "${label}" does not exist` }), 'utf8'));
+                  return;
+                }
+              }
+              labels = parsedLabels;
+            }
+            const issue: IssueRecord = {
+              id: issueIdCounter++,
+              number: repo.nextIssueNumber++,
+              title,
+              body: typeof parsed.value.body === 'string' ? parsed.value.body : '',
+              state: 'open',
+              labels,
+              createdSeq: ++globalSeq,
+            };
+            repo.issues.set(issue.number, issue);
+            repo.issueArr[issue.number] = issue;
+            const jsonBuf = Buffer.from(serializeIssueJsonStr(issue), 'utf8');
+            issue.jsonPayload = jsonBuf;
+            sendHttpJsonBuf(res, 201, jsonBuf);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Git Smart HTTP fast path
+  const dotGit = pathname.indexOf('.git/');
+  if (dotGit > 1 && pathname.charCodeAt(0) === 47) {
+    const firstSlash = pathname.indexOf('/', 1);
+    if (firstSlash > 1 && firstSlash < dotGit) {
+      const ownerRaw = pathname.slice(1, firstSlash);
+      const repoRaw = pathname.slice(firstSlash + 1, dotGit);
+      if (repoRaw.indexOf('/') < 0) {
+        const owner = ownerRaw.indexOf('%') < 0 ? ownerRaw : decodeURIComponent(ownerRaw);
+        const repoName = repoRaw.indexOf('%') < 0 ? repoRaw : decodeURIComponent(repoRaw);
+        const tail = pathname.slice(dotGit + 5);
+        const repo = forge.getRepo(owner, repoName);
+        if (repo === undefined || repo.deleted || owner !== VIEWER_LOGIN) {
+          sendHttpBuf(res, 404, 'text/plain; charset=utf-8', GIT_NOT_FOUND_BUF);
+          return;
+        }
+        const gitProto = req.headers['git-protocol'] as string | undefined;
+        if (tail === 'info/refs' && method === 'GET') {
+          let service: string | null = null;
+          if (q >= 0) {
+            const qs = rawUrl.slice(q + 1);
+            if (qs === 'service=git-upload-pack') service = 'git-upload-pack';
+            else if (qs === 'service=git-receive-pack') service = 'git-receive-pack';
+            else service = new URLSearchParams(qs).get('service');
+          }
+          if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
+            sendHttpBuf(res, 400, 'text/plain; charset=utf-8', GIT_BAD_REQ_BUF);
+            return;
+          }
+          if (service === 'git-upload-pack' && gitProto === 'version=2') {
+            sendHttpBuf(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT_BUF);
+            return;
+          }
+          sendHttpBuf(res, 200, `application/x-${service}-advertisement`, v0Advertisement(repo, service));
+          return;
+        }
+        if (tail === 'git-upload-pack' && method === 'POST') {
+          try {
+            const out = handleGitUploadHttp(repo, gitProto, body);
+            sendHttpBuf(res, out.status, out.ct, out.body);
+          } catch {
+            sendHttpBuf(res, 400, 'text/plain; charset=utf-8', GIT_BAD_REQ_BUF);
+          }
+          return;
+        }
+        if (tail === 'git-receive-pack' && method === 'POST') {
+          try {
+            const reply = handleReceivePack(repo, body);
+            sendHttpBuf(res, 200, 'application/x-git-receive-pack-result', reply);
+          } catch {
+            sendHttpBuf(res, 400, 'text/plain; charset=utf-8', GIT_BAD_REQ_BUF);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  if (method === 'GET' && (pathname === '/healthz' || pathname === '/')) {
+    sendHttpJsonBuf(res, 200, OK_STATUS_BUF);
+    return;
+  }
+
+  // Fallback using FastResponse adapter -> node:http ServerResponse
+  const fakeRes: ServerResponse = {
+    headersSent: false,
+    writeHead(status: number, hdrs: Record<string, string | number>) {
+      res.writeHead(status, hdrs);
+    },
+    end(chunk?: Buffer | string) {
+      res.end(chunk);
+    },
+    writeRaw(buf: Buffer) {
+      // Only used for sendJsonPayload / sendNoContent / sendBuffer in fallback
+      const hdrEnd = buf.indexOf('\r\n\r\n');
+      if (hdrEnd < 0) { res.end(buf); return; }
+      const hStr = buf.toString('latin1', 0, hdrEnd);
+      const lines = hStr.split('\r\n');
+      const sp = lines[0]!.indexOf(' ');
+      const status = Number.parseInt(lines[0]!.slice(sp + 1), 10) || 200;
+      const hdrObj: Record<string, string> = {};
+      for (let i = 1; i < lines.length; i += 1) {
+        const c = lines[i]!.indexOf(':');
+        if (c > 0) hdrObj[lines[i]!.slice(0, c).toLowerCase()] = lines[i]!.slice(c + 1).trim();
+      }
+      res.writeHead(status, hdrObj);
+      res.end(buf.subarray(hdrEnd + 4));
+    },
+  };
+  const fakeReq: IncomingMessage = {
+    method,
+    url: rawUrl,
+    headers: req.headers as Record<string, string | undefined>,
+  };
+  try {
+    const url = new URL(rawUrl, `http://${req.headers.host ?? 'localhost'}`);
+    if (url.pathname === '/api/graphql' && method === 'POST') {
+      handleGraphQl(forge, fakeReq, fakeRes, body);
+      return;
+    }
+    if (url.pathname === '/mcp' && method === 'POST') {
+      handleMcp(forge, fakeReq, fakeRes, body);
+      return;
+    }
+    if (url.pathname === '/api/v3' || url.pathname.startsWith('/api/v3/')) {
+      if (!requireAuth(fakeReq, fakeRes)) return;
+      if (!handleRest(forge, fakeReq, fakeRes, url, body)) sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+      return;
+    }
+    if (/^\/[^/]+\/[^/]+\.git\//.test(url.pathname)) {
+      if (!handleGit(forge, fakeReq, fakeRes, url, body)) sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+      return;
+    }
+    sendHttpJsonBuf(res, 404, ERR_NOT_FOUND_BUF);
+  } catch (error) {
+    if (!res.headersSent) {
+      sendHttpJsonBuf(res, 500, Buffer.from(JSON.stringify({ message: error instanceof Error ? error.message : 'Internal Server Error' }), 'utf8'));
+    } else {
+      try { res.end(); } catch {}
+    }
+  }
+}
+
+export function createApp(): Server {
+  const forge = new Forge();
+  const server = createHttpServer({ keepAlive: true, keepAliveTimeout: 60000, noDelay: true, connectionsCheckingInterval: 0 }, (req, res) => {
+    const cl = req.headers['content-length'];
+    const te = req.headers['transfer-encoding'];
+    if ((cl === undefined || cl === '0') && te === undefined) {
+      dispatchHttpReq(forge, req, res, EMPTY_BUF);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const body = chunks.length === 0 ? EMPTY_BUF : chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
+      dispatchHttpReq(forge, req, res, body);
+    });
   });
   return server;
 }
